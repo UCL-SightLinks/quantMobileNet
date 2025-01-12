@@ -276,7 +276,7 @@ def train_model(model, dataloader, loss_function, optimiser, epoch_number=25):
         # Saving each intermediary model since they're so small, and this lets load up any of them for performace difference examples later
         torch.save(quantized_model.state_dict(), "quantStateDict"+str(epoch)+".pth")
 
-        print(f"the above was Epoch {epoch} of {epoch_num} \nThe model has a size of", end=" ")
+        print(f"the above was Epoch {epoch} of {epoch_number} \nThe model has a size of", end=" ")
         print_size_of_model(quantized_model)
     
     return model
