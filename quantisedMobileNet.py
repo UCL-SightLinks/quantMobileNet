@@ -12,15 +12,20 @@
 # This is an adapted version of MobileNet, somewhere between versions 2/3, as some features of 3 were not required. There are
 # also some additions for our particular use case from miscallaneous sources
 
+from torchvision import transforms
 import torch
 from torch import nn, Tensor
 from torch.nn import functional as F
+from torch.utils.data import DataLoader, Subset
+import ClassUtils
 
 from torch.ao.quantization import QuantStub, DeQuantStub
 from torchvision.models.mobilenetv2 import _make_divisible
 
 import time
+import random
 import os
+import matplotlib.pyplot as plt
 
 # Squeeze: summarising global context by pooling feature maps into a single value
 # Excitation: Learning attention weights for each channel to prioritise the most relevant ones
@@ -32,6 +37,7 @@ class SqueezeExcitation(nn.Module):
         self.squeeze = nn.Conv2d(input_channels, squeeze_channels, 1)
         self.relu = nn.ReLU(inplace=True)
         self.unsqueeze = nn.Conv2d(squeeze_channels, input_channels, 1)
+        self.quant = nn.quantized.FloatFunctional()
     
     # Scale returns the feature attention map, how much attention should be payed to each input layer, in range [0, 1]
     # Inplace is used to save memory on operations - it might not be necessary in our case since we aren't using edge devices
@@ -45,7 +51,9 @@ class SqueezeExcitation(nn.Module):
         return F.hardsigmoid(scale, inplace=inplace)
     
     def forward(self, input: Tensor) -> Tensor:
-        return nn.quantized.FloatFunctional().mul(self._scale(input, True), input)
+        # print(self._scale(input, True))
+        # print(input)
+        return self.quant.mul(self._scale(input, True), input)
 
 
 # The basic building block of our convolutional neural network
@@ -232,7 +240,7 @@ class QuantizableMobileNetV2_5(MobileNetV2_5):
 def train_single_epoch(model, loss_fnc, optimiser, data_loader, device):
     model.train()
     running_loss = 0
-
+    running_time = 0.0
     for images, labels in data_loader:
         start_time = time.time()
         print(".", end=" ")
@@ -244,7 +252,9 @@ def train_single_epoch(model, loss_fnc, optimiser, data_loader, device):
         optimiser.step()
 
         running_loss += loss.item()
-        print(f"{(time.time() - start_time):.2f}", end=" ")
+        running_time += time.time() - start_time
+        
+        print(f"{(time.time() - start_time):.2f}, {(running_time):.2f}", end=" ")
 
     print(f"loss of {running_loss}")
     return
@@ -259,7 +269,7 @@ def adjust_quantisation_engine():
     print(torch.backends.quantized.supported_engines)
     torch.backends.quantized.engine = 'qnnpack'
 
-def train_model(model, dataloader, loss_function, optimiser, epoch_number=25):
+def train_model(model, dataloader, loss_function, optimiser, epoch_number=25, const_save=True):
     for epoch in range(epoch_number):
         train_single_epoch(model, loss_function, optimiser, dataloader, torch.device('cpu'))
         if epoch > 3:
@@ -269,14 +279,66 @@ def train_model(model, dataloader, loss_function, optimiser, epoch_number=25):
             # Freeze batch norm mean and variance estimates
             model.apply(torch.nn.intrinsic.qat.freeze_bn_stats)
 
-        # Check the accuracy after each epoch
-        quantized_model = torch.ao.quantization.convert(model.eval(), inplace=False)
-        quantized_model.eval()
+        if const_save:
+            quantized_model = torch.ao.quantization.convert(model.eval(), inplace=False)
+            quantized_model.eval()
 
-        # Saving each intermediary model since they're so small, and this lets load up any of them for performace difference examples later
-        torch.save(quantized_model.state_dict(), "quantStateDict"+str(epoch)+".pth")
+            # Saving each intermediary model since they're so small, and this lets load up any of them for performace difference examples later
+            torch.save(quantized_model.state_dict(), "quantStateDict"+str(epoch+1)+".pth")
 
-        print(f"the above was Epoch {epoch} of {epoch_number} \nThe model has a size of", end=" ")
-        print_size_of_model(quantized_model)
-    
+            print(f"the above was Epoch {epoch+1} of {epoch_number} \nThe model has a size of", end=" ")
+            print_size_of_model(quantized_model)
+
+        else:
+            print(f"the above was Epoch {epoch} of {epoch_number}")
+        
     return model
+
+
+learning_rate = 1e-3
+batch_size = 64   
+data_size = 2560
+
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+
+
+model = QuantizableMobileNetV2_5()
+
+# Adjust according to what your device supports
+torch.backends.quantized.engine = 'qnnpack'
+model.qconfig = torch.ao.quantization.default_qconfig
+
+optimiser = torch.optim.SGD(model.parameters(), lr= learning_rate)
+torch.ao.quantization.prepare_qat(model, inplace=True)
+
+# print('Inverted Residual Block: After preparation for QAT, note fake-quantization modules \n',model.feature_extraction[1].conv)
+
+
+
+dataset = ClassUtils.CrosswalkDataset("zebra_annotations/classification_data")
+train_loader = DataLoader(
+    Subset(dataset, random.sample(list(range(0, int(len(dataset) * 0.95))), data_size)),
+      batch_size=batch_size, shuffle=True)
+test_loader = DataLoader(
+    Subset(dataset, random.sample(list(range(int(len(dataset) * 0.95), len(dataset))), 256)),
+      batch_size=batch_size, shuffle=False)
+
+loss_function = nn.BCEWithLogitsLoss()
+
+model_updated = train_model(model, train_loader, loss_function, optimiser, epoch_number=8, const_save=False)
+
+quantized_model = torch.ao.quantization.convert(model_updated.eval(), inplace=True)
+
+model_loaded_state_dict = torch.load("quantStateDict8.pth")
+quantized_model.load_state_dict(model_loaded_state_dict)
+
+
+for images, labels in test_loader:
+    preds = quantized_model(images)
+    for i in range(len(preds)):
+        print(preds)
+        plt.imshow(torch.permute(images[i], (1, 2, 0)).detach().numpy())
+        plt.title(f"Prediction: {preds[i]}, Actual: {labels[i][0] == 1}")
+        plt.axis("off")
+        plt.show()
