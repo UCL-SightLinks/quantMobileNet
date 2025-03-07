@@ -1,3 +1,6 @@
+# BETA VERSION - NEEDS FURTHER DEVELOPMENT
+
+
 # Read these to catch up on what is (trying to at least) being done here
 # https://pytorch.org/tutorials/advanced/static_quantization_tutorial.html
 # https://pytorch.org/docs/stable/quantization.html#model-preparation-for-eager-mode-static-quantization
@@ -269,9 +272,12 @@ def adjust_quantisation_engine():
     print(torch.backends.quantized.supported_engines)
     torch.backends.quantized.engine = 'qnnpack'
 
-def train_model(model, dataloader, loss_function, optimiser, epoch_number=25, const_save=True):
+def train_model(model, dataloader, loss_function, optimiser, epoch_number=25, const_save=False, save=True):
     for epoch in range(epoch_number):
+        print("IT IS EPOCH", epoch)
         train_single_epoch(model, loss_function, optimiser, dataloader, torch.device('cpu'))
+
+        # Gradually freezes the unrequired observer parameters for quantisation and batch normalisation after a few epochs
         if epoch > 3:
             # Freeze quantizer parameters
             model.apply(torch.ao.quantization.disable_observer)
@@ -291,7 +297,10 @@ def train_model(model, dataloader, loss_function, optimiser, epoch_number=25, co
 
         else:
             print(f"the above was Epoch {epoch} of {epoch_number}")
-        
+    
+    if save:
+        torch.save(quantized_model.state_dict(), "full_quantStateDict.pth")
+                   
     return model
 
 
@@ -301,7 +310,9 @@ data_size = 2560
 
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
-
+# Update to whatever you call your model
+modelName = "quantStateDict8.pth"
+load = False
 
 model = QuantizableMobileNetV2_5()
 
@@ -311,9 +322,6 @@ model.qconfig = torch.ao.quantization.default_qconfig
 
 optimiser = torch.optim.SGD(model.parameters(), lr= learning_rate)
 torch.ao.quantization.prepare_qat(model, inplace=True)
-
-# print('Inverted Residual Block: After preparation for QAT, note fake-quantization modules \n',model.feature_extraction[1].conv)
-
 
 
 dataset = ClassUtils.CrosswalkDataset("zebra_annotations/classification_data")
@@ -325,17 +333,17 @@ test_loader = DataLoader(
       batch_size=batch_size, shuffle=False)
 
 loss_function = nn.BCEWithLogitsLoss()
-
-model_updated = train_model(model, train_loader, loss_function, optimiser, epoch_number=8, const_save=False)
+model_updated = train_model(model, train_loader, loss_function, optimiser, epoch_number=8, const_save=True)
 
 quantized_model = torch.ao.quantization.convert(model_updated.eval(), inplace=True)
 
-model_loaded_state_dict = torch.load("quantStateDict8.pth")
-quantized_model.load_state_dict(model_loaded_state_dict)
+if load:
+    model_loaded_state_dict = torch.load(modelName)
+    quantized_model.load_state_dict(model_loaded_state_dict)
 
 
 for images, labels in test_loader:
-    preds = quantized_model(images)
+    preds = torch.sigmoid(quantized_model(images))
     for i in range(len(preds)):
         print(preds)
         plt.imshow(torch.permute(images[i], (1, 2, 0)).detach().numpy())
